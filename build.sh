@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds workerd with our patches into ./out/workerd (Linux, for this machine's CPU).
-# Release binaries for arm64 and x86_64 come from CI (.github/workflows/build.yml).
+# The arm64 release binary for the sites VPS comes from CI (.github/workflows/build.yml).
 #   sh build.sh                         # version from VERSION
 #   BAZEL_ARGS="--jobs=4" sh build.sh   # fewer parallel jobs if the machine runs out of memory
 #

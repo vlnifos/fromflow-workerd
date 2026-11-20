@@ -1,13 +1,16 @@
-# Builds workerd + our patches for Linux arm64 and x86_64 and publishes both as a
+# Builds workerd + our patches for Linux arm64 (the sites VPS) and publishes it as a
 # GitHub release. The same toolchain image and script as a local build (Dockerfile,
-# build-in-container.sh), so the binaries match what the sites-host stand checks.
+# build-in-container.sh), so the binary matches what the sites-host stand checks; the
+# stand's x86_64 binary is built locally (build.sh), not here.
 #
 # Runs when VERSION or a patch changes on main, or by hand (Actions → build workerd →
 # Run workflow). The release tag is <VERSION>-ff.<hash of the patches>: the same
 # version + patches is never built twice unless run by hand with `force`.
 #
-# Free standard runners of a public repository: 4 cores, 16 GB RAM. No Bazel cache
-# between runs — every run compiles V8 (2.5–4 h on 4 cores, the job limit is 6 h).
+# Free standard runners of a public repository: 4 cores, 16 GB RAM, job limit 6 h.
+# Bazel's disk cache is kept in the Actions cache per workerd version: the first build
+# of a version compiles V8 (~70 min), a later patch change recompiles only what it
+# touches. A new VERSION starts from the previous version's cache.
 name: build workerd
 
 on:
@@ -53,16 +56,10 @@ jobs:
   build:
     needs: plan
     if: needs.plan.outputs.build == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-          - arch: x64
-            runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 355
+    env:
+      ARCH: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -84,22 +81,51 @@ jobs:
       - name: Toolchain image
         run: docker build -q -t workerd-toolchain .
 
+      # Only Bazel's disk cache (action outputs), not its whole output base: that one is
+      # tens of GB, over the Actions cache limit (10 GB per repository).
+      - name: Restore Bazel disk cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.WORK }}/cache/bazel-disk
+          key: bazel-disk-${{ env.ARCH }}-${{ needs.plan.outputs.tag }}
+          restore-keys: |
+            bazel-disk-${{ env.ARCH }}-${{ needs.plan.outputs.version }}-
+            bazel-disk-${{ env.ARCH }}-
+
       - name: Build
+        id: build
         run: |
           started=$(date +%s)
+          sudo du -sh "$WORK/cache/bazel-disk" 2>/dev/null || echo "no Bazel disk cache: full build"
+          # Before the build: a failed or timed-out build still saves what it compiled.
+          echo "started=true" >> "$GITHUB_OUTPUT"
           docker run --rm \
             -v "$WORK/src:/workerd" \
             -v "$WORK/cache:/root/.cache" \
             -v "$PWD/patches:/patches:ro" \
             -v "$WORK/out:/out" \
-            workerd-toolchain build-workerd "${{ needs.plan.outputs.version }}" --strip=always
+            workerd-toolchain build-workerd "${{ needs.plan.outputs.version }}" --strip=always \
+              --disk_cache=/root/.cache/bazel-disk
           echo "built in $(( ($(date +%s) - started) / 60 )) min"
-          sudo du -sh "$WORK/src" "$WORK/cache" || true
+          sudo du -sh "$WORK/src" "$WORK/cache" "$WORK/cache/bazel-disk" || true
           df -h / /mnt 2>/dev/null || df -h /
+
+      # The container writes as root; the cache step reads as the runner user.
+      - name: Own Bazel disk cache
+        if: always() && steps.build.outputs.started == 'true'
+        run: sudo chown -R "$(id -u):$(id -g)" "$WORK/cache/bazel-disk" && du -sh "$WORK/cache/bazel-disk"
+
+      # Saved even when the build fails: the next run resumes from it.
+      - name: Save Bazel disk cache
+        if: always() && steps.build.outputs.started == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.WORK }}/cache/bazel-disk
+          key: bazel-disk-${{ env.ARCH }}-${{ needs.plan.outputs.tag }}
 
       - name: Package
         run: |
-          name=workerd-linux-${{ matrix.arch }}
+          name=workerd-linux-$ARCH
           sudo cp "$WORK/out/workerd" "$name"
           sudo chown "$(id -u)" "$name"
           file "$name"
@@ -109,8 +135,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: workerd-linux-${{ matrix.arch }}
-          path: workerd-linux-${{ matrix.arch }}.gz*
+          name: workerd-linux-${{ env.ARCH }}
+          path: workerd-linux-${{ env.ARCH }}.gz*
           retention-days: 7
 
   release:

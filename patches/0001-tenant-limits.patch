@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..c3d37aa
 --- /dev/null
 +++ b/src/workerd/server/factory/tenant-limits.c++
-@@ -0,0 +1,593 @@
+@@ -0,0 +1,631 @@
 +// Copyright (c) 2026 FromFlow.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -119,6 +119,12 @@ index 0000000..c3d37aa
 +
 +kj::Exception cpuLimitError() {
 +  return JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded CPU time limit.");
++}
++
++// The cold-isolate budget (startup-sized, see completedRequest()) ran out: the site cannot start
++// at all, or loops — sites-host strikes it, unlike a warm request over its budget.
++kj::Exception startupCpuLimitError() {
++  return JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded CPU time limit while starting.");
 +}
 +
 +kj::Exception memoryLimitError() {
@@ -379,7 +385,20 @@ index 0000000..c3d37aa
 +    return {};
 +  }
 +
-+  void completedRequest(kj::StringPtr id) const override {}
++  // The first requests of an isolate do the rest of its startup: bundlers load the app through
++  // dynamic import() on the first request (TanStack Start: router, React, routes), which costs
++  // startup-sized CPU. Until a request has completed, requests get the startup budget.
++  void completedRequest(kj::StringPtr id) const override {
++    warm.store(true, std::memory_order_relaxed);
++  }
++
++  bool isWarm() const {
++    return warm.load(std::memory_order_relaxed);
++  }
++
++  int64_t startupCpuNs() const {
++    return limits.startupCpuNs;
++  }
 +
 +  bool exitJs(jsg::Lock& lock) const override {
 +    return condemned.load(std::memory_order_relaxed);
@@ -445,6 +464,7 @@ index 0000000..c3d37aa
 +  v8::IsolateGroup group;
 +  std::atomic<v8::Isolate*> isolate{nullptr};
 +  mutable std::atomic<bool> condemned{false};
++  mutable std::atomic<bool> warm{false};
 +  TrackedWasmInstanceList trackedWasmInstances;
 +};
 +
@@ -470,7 +490,16 @@ index 0000000..c3d37aa
 +      return kj::heap<MemoryScope>(kj::addRef(*this), isolateLimits);
 +    }
 +
-+    int64_t remaining = limits.cpuNs - usedNs;
++    // Fixed at the request's first JS: a cold isolate's request keeps the startup budget even if
++    // another request completes meanwhile. Both enforcers are tenant ones (worker-factory.c++
++    // picks them together), so the downcast is safe.
++    if (budgetNs < 0) {
++      auto& tenantIsolate = static_cast<const TenantIsolateLimitEnforcer&>(isolateLimits);
++      budgetNs = tenantIsolate.isWarm() ? limits.cpuNs
++                                        : kj::max(limits.cpuNs, tenantIsolate.startupCpuNs());
++    }
++
++    int64_t remaining = budgetNs - usedNs;
 +    if (remaining <= 0) {
 +      markExceeded(EventOutcome::EXCEEDED_CPU);
 +      lock.v8Isolate->TerminateExecution();
@@ -481,7 +510,7 @@ index 0000000..c3d37aa
 +    auto& slot = scope->slot;
 +    slot.start(lock.v8Isolate, remaining);
 +    KJ_IF_SOME(cb, nearlyExceeded) {
-+      int64_t warnTotal = limits.cpuNs * NEARLY_EXCEEDED_PERCENT / 100;
++      int64_t warnTotal = budgetNs * NEARLY_EXCEEDED_PERCENT / 100;
 +      if (warnTotal > usedNs) {
 +        slot.warnAtNs = warnTotal - usedNs;
 +        slot.nearlyExceeded = &cb;
@@ -514,7 +543,7 @@ index 0000000..c3d37aa
 +
 +  kj::Promise<void> onLimitsExceeded() override {
 +    KJ_IF_SOME(outcome, exceeded) {
-+      return errorFor(outcome);
++      return limitError(outcome);
 +    }
 +    auto paf = kj::newPromiseAndFulfiller<void>();
 +    fulfillers.add(kj::mv(paf.fulfiller));
@@ -527,7 +556,7 @@ index 0000000..c3d37aa
 +
 +  void requireLimitsNotExceeded() override {
 +    KJ_IF_SOME(outcome, exceeded) {
-+      kj::throwFatalException(errorFor(outcome));
++      kj::throwFatalException(limitError(outcome));
 +    }
 +  }
 +
@@ -575,11 +604,18 @@ index 0000000..c3d37aa
 +    }
 +  };
 +
++  kj::Exception limitError(EventOutcome outcome) const {
++    if (outcome == EventOutcome::EXCEEDED_CPU && budgetNs > limits.cpuNs) {
++      return startupCpuLimitError();
++    }
++    return errorFor(outcome);
++  }
++
 +  void markExceeded(EventOutcome outcome) {
 +    if (exceeded != kj::none) return;
 +    exceeded = outcome;
 +    for (auto& fulfiller: fulfillers) {
-+      fulfiller->reject(errorFor(outcome));
++      fulfiller->reject(limitError(outcome));
 +    }
 +    fulfillers.clear();
 +  }
@@ -588,6 +624,8 @@ index 0000000..c3d37aa
 +  // Time this request's finished JS scopes held the isolate (see CpuWatchdog). Touched only on
 +  // the request's thread.
 +  int64_t usedNs = 0;
++  // This request's CPU budget; -1 until its first JS (see enterJs()).
++  int64_t budgetNs = -1;
 +  kj::Maybe<EventOutcome> exceeded;
 +  kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> fulfillers;
 +  kj::Maybe<kj::Function<void()>> nearlyExceeded;
@@ -615,7 +653,7 @@ new file mode 100644
 index 0000000..539501f
 --- /dev/null
 +++ b/src/workerd/server/factory/tenant-limits.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,64 @@
 +// Copyright (c) 2026 FromFlow.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -642,7 +680,8 @@ index 0000000..539501f
 +//
 +// Opt-in, read once from the environment; unset = upstream behaviour:
 +//   WORKERD_TENANT_CPU_MS          CPU time per request (all enterJs() scopes of the request)
-+//   WORKERD_TENANT_STARTUP_CPU_MS  CPU time for script startup and dynamic imports (default 1000)
++//   WORKERD_TENANT_STARTUP_CPU_MS  CPU time for script startup, dynamic imports and the requests
++//                                  of a fresh isolate until one completes (default 1000)
 +//   WORKERD_TENANT_HEAP_MB         V8 old-generation heap per isolate
 +//   WORKERD_TENANT_BUFFERS_MB      ArrayBuffer memory per isolate (default: the heap limit)
 +
