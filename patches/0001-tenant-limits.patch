@@ -1,0 +1,735 @@
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 63dfe2f..3d6a299 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -27,6 +27,8 @@ wd_cc_library(
+ wd_cc_library(
+     name = "worker-factory",
+     srcs = [
++        "tenant-limits.c++",
++        "tenant-limits.h",
+         "worker-factory.c++",
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+diff --git a/src/workerd/server/factory/tenant-limits.c++ b/src/workerd/server/factory/tenant-limits.c++
+new file mode 100644
+index 0000000..c3d37aa
+--- /dev/null
++++ b/src/workerd/server/factory/tenant-limits.c++
+@@ -0,0 +1,593 @@
++// Copyright (c) 2026 FromFlow.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "tenant-limits.h"
++
++#include <workerd/io/actor-cache.h>
++#include <workerd/io/io-context.h>
++#include <workerd/io/tracked-wasm-instance.h>
++#include <workerd/io/worker.h>
++#include <workerd/jsg/exception.h>
++#include <workerd/jsg/jsg.h>
++
++#include <kj/debug.h>
++#include <kj/function.h>
++#include <kj/vector.h>
++
++#include <v8-array-buffer.h>
++
++#include <pthread.h>
++#include <time.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <memory>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace workerd::server {
++
++namespace {
++
++constexpr int64_t NS_PER_MS = 1'000'000;
++
++// How often the watchdog looks at the running scopes. A request runs at most about two ticks
++// past its budget (plus however long V8 takes to reach its next interrupt check).
++constexpr auto WATCHDOG_TICK = std::chrono::milliseconds(5);
++
++// The watchdog goes to sleep after this many ticks (1 s) without any JS entered.
++constexpr int IDLE_TICKS = 200;
++
++// The near-limit callback fires at this share of the request's budget.
++constexpr int64_t NEARLY_EXCEEDED_PERCENT = 80;
++
++int64_t envMs(const char* name, int64_t fallback) {
++  const char* raw = getenv(name);
++  if (raw == nullptr || *raw == '\0') return fallback;
++  char* end = nullptr;
++  long long value = strtoll(raw, &end, 10);
++  KJ_REQUIRE(end != raw && *end == '\0' && value >= 0, "invalid number in environment", name, raw);
++  return value;
++}
++
++TenantLimits parseLimits() {
++  TenantLimits limits;
++  limits.cpuNs = envMs("WORKERD_TENANT_CPU_MS", 0) * NS_PER_MS;
++  limits.startupCpuNs =
++      limits.cpuNs > 0 ? envMs("WORKERD_TENANT_STARTUP_CPU_MS", 1000) * NS_PER_MS : 0;
++  int64_t heapMb = envMs("WORKERD_TENANT_HEAP_MB", 0);
++  limits.heapBytes = static_cast<size_t>(heapMb) * 1024 * 1024;
++  limits.bufferBytes =
++      static_cast<size_t>(envMs("WORKERD_TENANT_BUFFERS_MB", heapMb)) * 1024 * 1024;
++  if (limits.enabled()) {
++    KJ_LOG(INFO, "tenant limits on", limits.cpuNs / NS_PER_MS, limits.startupCpuNs / NS_PER_MS,
++        limits.heapBytes / (1024 * 1024), limits.bufferBytes / (1024 * 1024));
++  }
++  return limits;
++}
++
++// The CPU clock of the calling thread, looked up once per thread.
++clockid_t currentThreadCpuClock() {
++  thread_local clockid_t clock = []() {
++    clockid_t c;
++    KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &c) == 0, "pthread_getcpuclockid failed");
++    return c;
++  }();
++  return clock;
++}
++
++// Wall time from the vDSO: no system call, cheap under gVisor too. The hot path (every entry
++// into JS) only ever reads this clock.
++int64_t monotonicNs() {
++  timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
++}
++
++// A thread's CPU clock: a real system call, and an expensive one for another thread under
++// gVisor (measured: reading it on every scope cost up to half the throughput). Only the
++// watchdog calls it, and only for a scope already past its budget.
++int64_t readCpuNs(clockid_t clock) {
++  timespec ts;
++  if (clock_gettime(clock, &ts) != 0) return 0;
++  return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
++}
++
++kj::Exception cpuLimitError() {
++  return JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded CPU time limit.");
++}
++
++kj::Exception memoryLimitError() {
++  return JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded memory limit.");
++}
++
++kj::Exception errorFor(EventOutcome outcome) {
++  return outcome == EventOutcome::EXCEEDED_MEMORY ? memoryLimitError() : cpuLimitError();
++}
++
++// =======================================================================================
++// CPU watchdog: one thread per process, watching every scope that is running JS right now.
++//
++// A scope is charged by wall time while it holds the isolate lock: JS between two awaits runs
++// without blocking, so wall time is CPU time unless the OS takes the thread off the core. Past
++// the budget, the watchdog looks at the thread's real CPU clock over one tick and stops the JS
++// only if the thread kept burning CPU — a scope that was merely descheduled is not killed for
++// the wait.
++
++class CpuWatchdog {
++ public:
++  // One running JS scope. Lives on the heap of its scope object; registered for exactly as long
++  // as the JS runs, under the isolate lock — so `isolate` is alive whenever the watchdog sees it.
++  struct Slot {
++    v8::Isolate* isolate = nullptr;
++    clockid_t clock{};
++    int64_t startWallNs = 0;
++    int64_t budgetNs = 0;
++    // 0 = no near-limit notification for this scope.
++    int64_t warnAtNs = 0;
++    kj::Function<void()>* nearlyExceeded = nullptr;
++    bool warned = false;
++    // Watchdog only: the thread's CPU clock at the last look, once past the budget.
++    int64_t probeCpuNs = -1;
++    int64_t probeWallNs = 0;
++    std::atomic<bool> fired{false};
++
++    // Called on the scope's own thread when the JS starts.
++    void start(v8::Isolate* v8Isolate, int64_t budget) {
++      isolate = v8Isolate;
++      clock = currentThreadCpuClock();
++      startWallNs = monotonicNs();
++      budgetNs = budget;
++    }
++
++    int64_t elapsedNs() const {
++      return monotonicNs() - startWallNs;
++    }
++  };
++
++  static CpuWatchdog& get() {
++    // Never destroyed: the thread runs for the life of the process.
++    static CpuWatchdog* instance = new CpuWatchdog();
++    return *instance;
++  }
++
++  void add(Slot& slot) {
++    std::lock_guard<std::mutex> guard(mutex);
++    slots.push_back(&slot);
++    ++entries;
++    // Only a sleeping watchdog is woken. Waking it on every entry into JS (the scope list of a
++    // single-threaded process empties after every scope) cost ~half the throughput: a thread
++    // wake-up plus a fight for this mutex per scope.
++    if (sleeping) {
++      sleeping = false;
++      wake.notify_one();
++    }
++  }
++
++  void remove(Slot& slot) {
++    std::lock_guard<std::mutex> guard(mutex);
++    auto it = std::find(slots.begin(), slots.end(), &slot);
++    if (it != slots.end()) slots.erase(it);
++  }
++
++ private:
++  CpuWatchdog() {
++    std::thread([this]() { run(); }).detach();
++  }
++
++  void run() {
++    std::unique_lock<std::mutex> lock(mutex);
++    uint64_t seenEntries = entries;
++    int idleTicks = 0;
++    for (;;) {
++      // Idle (no JS entered for IDLE_TICKS): sleep until add() wakes us — no ticking in an idle
++      // process. Busy: look at the scopes every tick; nothing wakes the tick early. Both waits
++      // release the mutex.
++      if (idleTicks >= IDLE_TICKS) {
++        sleeping = true;
++        wake.wait(lock, [this]() { return !sleeping; });
++        idleTicks = 0;
++      }
++      wake.wait_for(lock, WATCHDOG_TICK);
++      if (slots.empty() && entries == seenEntries) {
++        ++idleTicks;
++        continue;
++      }
++      idleTicks = 0;
++      seenEntries = entries;
++      int64_t now = monotonicNs();
++      for (Slot* slot: slots) {
++        if (slot->fired.load(std::memory_order_relaxed)) continue;
++        int64_t wall = now - slot->startWallNs;
++        if (wall < slot->budgetNs) {
++          if (!slot->warned && slot->warnAtNs > 0 && wall >= slot->warnAtNs) {
++            slot->warned = true;
++            // Signal-safe by LimitEnforcer's contract; must not take the isolate lock.
++            if (slot->nearlyExceeded != nullptr) (*slot->nearlyExceeded)();
++          }
++          continue;
++        }
++        // Past the budget by wall time: confirm with the CPU clock over the next tick.
++        int64_t cpu = readCpuNs(slot->clock);
++        if (slot->probeCpuNs >= 0) {
++          int64_t cpuDelta = cpu - slot->probeCpuNs;
++          int64_t wallDelta = now - slot->probeWallNs;
++          if (wallDelta > 0 && cpuDelta * 2 >= wallDelta) {
++            slot->fired.store(true, std::memory_order_relaxed);
++            // Thread-safe by V8's contract; JS stops at its next interrupt check.
++            slot->isolate->TerminateExecution();
++            continue;
++          }
++        }
++        slot->probeCpuNs = cpu;
++        slot->probeWallNs = now;
++      }
++    }
++  }
++
++  std::mutex mutex;
++  std::condition_variable wake;
++  std::vector<Slot*> slots;
++  // Guarded by `mutex`: scopes added so far, and whether the watchdog sleeps until the next one.
++  uint64_t entries = 0;
++  bool sleeping = false;
++};
++
++// =======================================================================================
++// ArrayBuffer memory: a byte budget per isolate on top of V8's default allocator.
++
++class BudgetedArrayBufferAllocator final: public v8::ArrayBuffer::Allocator {
++ public:
++  BudgetedArrayBufferAllocator(std::unique_ptr<v8::ArrayBuffer::Allocator> inner, size_t budget)
++      : inner(kj::mv(inner)),
++        budget(budget) {}
++
++  void* Allocate(size_t length) override {
++    if (!reserve(length)) return nullptr;
++    void* data = inner->Allocate(length);
++    if (data == nullptr) release(length);
++    return data;
++  }
++
++  void* AllocateUninitialized(size_t length) override {
++    if (!reserve(length)) return nullptr;
++    void* data = inner->AllocateUninitialized(length);
++    if (data == nullptr) release(length);
++    return data;
++  }
++
++  void Free(void* data, size_t length) override {
++    inner->Free(data, length);
++    release(length);
++  }
++
++  size_t MaxAllocationSize() const override {
++    return kj::min(inner->MaxAllocationSize(), budget);
++  }
++
++ private:
++  bool reserve(size_t length) {
++    size_t before = used.fetch_add(length, std::memory_order_relaxed);
++    if (before + length > budget) {
++      used.fetch_sub(length, std::memory_order_relaxed);
++      return false;
++    }
++    return true;
++  }
++
++  void release(size_t length) {
++    used.fetch_sub(length, std::memory_order_relaxed);
++  }
++
++  std::unique_ptr<v8::ArrayBuffer::Allocator> inner;
++  const size_t budget;
++  std::atomic<size_t> used{0};
++};
++
++std::unique_ptr<v8::ArrayBuffer::Allocator> newDefaultAllocator(
++    [[maybe_unused]] v8::IsolateGroup& group) {
++  // Same choice as jsg's isolate setup (setup.c++) makes when no allocator is given.
++#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
++  return std::unique_ptr<v8::ArrayBuffer::Allocator>(
++      v8::ArrayBuffer::Allocator::NewDefaultAllocator(group));
++#else
++  return std::unique_ptr<v8::ArrayBuffer::Allocator>(
++      v8::ArrayBuffer::Allocator::NewDefaultAllocator());
++#endif
++}
++
++// =======================================================================================
++// Isolate: V8 heap limit, condemnation on overflow, startup CPU.
++
++class TenantIsolateLimitEnforcer final: public IsolateLimitEnforcer {
++ public:
++  TenantIsolateLimitEnforcer(const TenantLimits& limits, v8::IsolateGroup group)
++      : limits(limits),
++        group(kj::mv(group)) {}
++
++  v8::Isolate::CreateParams getCreateParams() override {
++    v8::Isolate::CreateParams params;
++    if (limits.heapBytes > 0) {
++      params.constraints.set_max_old_generation_size_in_bytes(limits.heapBytes);
++    }
++    if (limits.bufferBytes > 0) {
++      // jsg keeps a given allocator instead of creating its default one.
++      params.array_buffer_allocator_shared = std::make_shared<BudgetedArrayBufferAllocator>(
++          newDefaultAllocator(group), limits.bufferBytes);
++    }
++    return params;
++  }
++
++  void customizeIsolate(v8::Isolate* v8Isolate) override {
++    isolate.store(v8Isolate, std::memory_order_relaxed);
++    if (limits.heapBytes > 0) {
++      v8Isolate->AddNearHeapLimitCallback(&nearHeapLimit, this);
++    }
++  }
++
++  ActorCacheSharedLruOptions getActorCacheLruOptions() override {
++    // Same as upstream's NullIsolateLimitEnforcer.
++    return {.softLimit = 16 * (1ull << 20),
++      .hardLimit = 128 * (1ull << 20),
++      .staleTimeout = 30 * kj::SECONDS,
++      .dirtyListByteLimit = 8 * (1ull << 20),
++      .maxKeysPerRpc = 128,
++      .neverFlush = true};
++  }
++
++  kj::Own<void> enterStartupJs(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return enterTimed(lock, limitErrorOrTime);
++  }
++  kj::Own<void> enterStartupPython(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return enterTimed(lock, limitErrorOrTime);
++  }
++  kj::Own<void> enterDynamicImportJs(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return enterTimed(lock, limitErrorOrTime);
++  }
++  kj::Own<void> enterLoggingJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++    return {};
++  }
++  kj::Own<void> enterInspectorJs(
++      jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++    return {};
++  }
++
++  void completedRequest(kj::StringPtr id) const override {}
++
++  bool exitJs(jsg::Lock& lock) const override {
++    return condemned.load(std::memory_order_relaxed);
++  }
++
++  void reportMetrics(IsolateObserver& isolateMetrics) const override {}
++
++  // checkPbkdfIterations / checkScryptCost: not overridden, so the interface's default caps
++  // apply (upstream's local server lifts them; for foreign code they are CPU bombs).
++
++  bool hasExcessivelyExceededHeapLimit() const override {
++    return condemned.load(std::memory_order_relaxed);
++  }
++
++  const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
++    return trackedWasmInstances;
++  }
++
++ private:
++  // V8 is about to run out of heap. Stop the JS, condemn the isolate, and give V8 just enough
++  // room to unwind — the alternative is a fatal OOM that takes the whole process down.
++  static size_t nearHeapLimit(void* data, size_t currentHeapLimit, size_t initialHeapLimit) {
++    auto& self = *static_cast<TenantIsolateLimitEnforcer*>(data);
++    self.condemned.store(true, std::memory_order_relaxed);
++    if (v8::Isolate* v8Isolate = self.isolate.load(std::memory_order_relaxed)) {
++      v8Isolate->TerminateExecution();
++    }
++    // Headroom: a quarter of the limit, at most twice the configured limit in total. Past that
++    // V8 aborts the process, and the supervisor restarts it.
++    size_t headroom = initialHeapLimit / 4;
++    if (currentHeapLimit + headroom > initialHeapLimit * 2) return currentHeapLimit;
++    return currentHeapLimit + headroom;
++  }
++
++  // A startup-style scope: CPU-limited by the watchdog, result reported through the out-param.
++  struct TimedScope {
++    CpuWatchdog::Slot slot;
++    kj::OneOf<kj::Exception, kj::Duration>& out;
++
++    explicit TimedScope(kj::OneOf<kj::Exception, kj::Duration>& out): out(out) {}
++    ~TimedScope() noexcept(false) {
++      CpuWatchdog::get().remove(slot);
++      int64_t used = slot.elapsedNs();
++      if (slot.fired.load(std::memory_order_relaxed)) {
++        out = JSG_KJ_EXCEPTION(
++            OVERLOADED, Error, "Worker exceeded CPU time limit during startup.");
++      } else {
++        out = used * kj::NANOSECONDS;
++      }
++    }
++  };
++
++  kj::Own<void> enterTimed(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const {
++    if (limits.startupCpuNs <= 0) return {};
++    auto scope = kj::heap<TimedScope>(limitErrorOrTime);
++    scope->slot.start(lock.v8Isolate, limits.startupCpuNs);
++    CpuWatchdog::get().add(scope->slot);
++    return scope;
++  }
++
++  TenantLimits limits;
++  v8::IsolateGroup group;
++  std::atomic<v8::Isolate*> isolate{nullptr};
++  mutable std::atomic<bool> condemned{false};
++  TrackedWasmInstanceList trackedWasmInstances;
++};
++
++// =======================================================================================
++// Request: CPU across all JS scopes of the request; memory via the isolate's condemnation.
++
++class TenantLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
++ public:
++  explicit TenantLimitEnforcer(const TenantLimits& limits): limits(limits) {}
++
++  kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
++    auto& isolateLimits = Worker::Isolate::from(lock).getLimitEnforcer();
++
++    // The isolate already blew its heap: run no more JS in it. The termination makes IoContext
++    // call requireLimitsNotExceeded(), which reports the memory limit.
++    if (isolateLimits.hasExcessivelyExceededHeapLimit()) {
++      markExceeded(EventOutcome::EXCEEDED_MEMORY);
++      lock.v8Isolate->TerminateExecution();
++      return {};
++    }
++
++    if (limits.cpuNs <= 0) {
++      return kj::heap<MemoryScope>(kj::addRef(*this), isolateLimits);
++    }
++
++    int64_t remaining = limits.cpuNs - usedNs;
++    if (remaining <= 0) {
++      markExceeded(EventOutcome::EXCEEDED_CPU);
++      lock.v8Isolate->TerminateExecution();
++      return {};
++    }
++
++    auto scope = kj::heap<CpuScope>(kj::addRef(*this), isolateLimits);
++    auto& slot = scope->slot;
++    slot.start(lock.v8Isolate, remaining);
++    KJ_IF_SOME(cb, nearlyExceeded) {
++      int64_t warnTotal = limits.cpuNs * NEARLY_EXCEEDED_PERCENT / 100;
++      if (warnTotal > usedNs) {
++        slot.warnAtNs = warnTotal - usedNs;
++        slot.nearlyExceeded = &cb;
++      }
++    }
++    CpuWatchdog::get().add(slot);
++    return scope;
++  }
++
++  void topUpActor() override {}
++  void newSubrequest(bool isInHouse) override {}
++  void newKvRequest(KvOpType op) override {}
++  void newAnalyticsEngineRequest() override {}
++  kj::Promise<void> limitDrain() override {
++    return kj::NEVER_DONE;
++  }
++  kj::Promise<void> limitScheduled() override {
++    return kj::NEVER_DONE;
++  }
++  kj::Duration getAlarmLimit() override {
++    return 15 * kj::MINUTES;
++  }
++  size_t getBufferingLimit() override {
++    return kj::maxValue;
++  }
++
++  kj::Maybe<EventOutcome> getLimitsExceeded() override {
++    return exceeded;
++  }
++
++  kj::Promise<void> onLimitsExceeded() override {
++    KJ_IF_SOME(outcome, exceeded) {
++      return errorFor(outcome);
++    }
++    auto paf = kj::newPromiseAndFulfiller<void>();
++    fulfillers.add(kj::mv(paf.fulfiller));
++    return kj::mv(paf.promise);
++  }
++
++  void setCpuLimitNearlyExceededCallback(kj::Function<void()> cb) override {
++    nearlyExceeded = kj::mv(cb);
++  }
++
++  void requireLimitsNotExceeded() override {
++    KJ_IF_SOME(outcome, exceeded) {
++      kj::throwFatalException(errorFor(outcome));
++    }
++  }
++
++  void reportMetrics(RequestObserver& requestMetrics) override {}
++  kj::Duration consumeTimeElapsedForPeriodicLogging() override {
++    return 0 * kj::SECONDS;
++  }
++  size_t getSqliteMemoryUsage() const override {
++    return 0;
++  }
++
++ private:
++  // Only notices the heap condemnation (no CPU limit configured).
++  struct MemoryScope {
++    kj::Own<TenantLimitEnforcer> owner;
++    const IsolateLimitEnforcer& isolateLimits;
++
++    MemoryScope(kj::Own<TenantLimitEnforcer> owner, const IsolateLimitEnforcer& isolateLimits)
++        : owner(kj::mv(owner)),
++          isolateLimits(isolateLimits) {}
++    ~MemoryScope() noexcept(false) {
++      if (isolateLimits.hasExcessivelyExceededHeapLimit()) {
++        owner->markExceeded(EventOutcome::EXCEEDED_MEMORY);
++      }
++    }
++  };
++
++  struct CpuScope {
++    kj::Own<TenantLimitEnforcer> owner;
++    const IsolateLimitEnforcer& isolateLimits;
++    CpuWatchdog::Slot slot;
++
++    CpuScope(kj::Own<TenantLimitEnforcer> owner, const IsolateLimitEnforcer& isolateLimits)
++        : owner(kj::mv(owner)),
++          isolateLimits(isolateLimits) {}
++    ~CpuScope() noexcept(false) {
++      // After remove() the watchdog can no longer terminate this isolate on our behalf.
++      CpuWatchdog::get().remove(slot);
++      owner->usedNs += slot.elapsedNs();
++      if (isolateLimits.hasExcessivelyExceededHeapLimit()) {
++        owner->markExceeded(EventOutcome::EXCEEDED_MEMORY);
++      } else if (slot.fired.load(std::memory_order_relaxed)) {
++        owner->markExceeded(EventOutcome::EXCEEDED_CPU);
++      }
++    }
++  };
++
++  void markExceeded(EventOutcome outcome) {
++    if (exceeded != kj::none) return;
++    exceeded = outcome;
++    for (auto& fulfiller: fulfillers) {
++      fulfiller->reject(errorFor(outcome));
++    }
++    fulfillers.clear();
++  }
++
++  TenantLimits limits;
++  // Time this request's finished JS scopes held the isolate (see CpuWatchdog). Touched only on
++  // the request's thread.
++  int64_t usedNs = 0;
++  kj::Maybe<EventOutcome> exceeded;
++  kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> fulfillers;
++  kj::Maybe<kj::Function<void()>> nearlyExceeded;
++};
++
++}  // namespace
++
++const TenantLimits& tenantLimits() {
++  static const TenantLimits limits = parseLimits();
++  return limits;
++}
++
++kj::Own<LimitEnforcer> newTenantLimitEnforcer(const TenantLimits& limits) {
++  return kj::refcounted<TenantLimitEnforcer>(limits);
++}
++
++kj::Own<IsolateLimitEnforcer> newTenantIsolateLimitEnforcer(
++    const TenantLimits& limits, v8::IsolateGroup group) {
++  return kj::refcounted<TenantIsolateLimitEnforcer>(limits, kj::mv(group));
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/tenant-limits.h b/src/workerd/server/factory/tenant-limits.h
+new file mode 100644
+index 0000000..539501f
+--- /dev/null
++++ b/src/workerd/server/factory/tenant-limits.h
+@@ -0,0 +1,63 @@
++// Copyright (c) 2026 FromFlow.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++// Multi-tenant resource limits for workerd: per-request CPU time and per-isolate V8 heap.
++//
++// Upstream workerd is single-tenant and ships no-op enforcers (NullLimitEnforcer,
++// NullIsolateLimitEnforcer in worker-factory.c++). When workerd hosts code from many owners in
++// one process, one `while(true)` stalls every worker of the process, and one heap blowup kills
++// it. These enforcers stop the offending request instead:
++//
++// - CPU: JS scopes are timed by the (vDSO) monotonic clock; a watchdog thread calls
++//   v8::Isolate::TerminateExecution() when a request's budget is spent and the thread's real
++//   CPU clock confirms it is still burning CPU. IoContext already turns the termination into
++//   the limit error (it calls requireLimitsNotExceeded()).
++// - Heap: a V8 heap limit per isolate (= per worker) plus a near-heap-limit callback that
++//   terminates the running JS and condemns the isolate: further JS in it is refused, so the
++//   process survives and the supervisor can recycle it.
++// - Buffers: ArrayBuffer backing stores live outside the V8 heap, so the heap limit does not see
++//   them. A per-isolate allocator with a byte budget refuses allocations past it (JS gets
++//   "RangeError: Array buffer allocation failed"); the isolate stays usable.
++//
++// Opt-in, read once from the environment; unset = upstream behaviour:
++//   WORKERD_TENANT_CPU_MS          CPU time per request (all enterJs() scopes of the request)
++//   WORKERD_TENANT_STARTUP_CPU_MS  CPU time for script startup and dynamic imports (default 1000)
++//   WORKERD_TENANT_HEAP_MB         V8 old-generation heap per isolate
++//   WORKERD_TENANT_BUFFERS_MB      ArrayBuffer memory per isolate (default: the heap limit)
++
++#include <workerd/io/limit-enforcer.h>
++
++#include <kj/memory.h>
++
++#include <cstddef>
++#include <cstdint>
++
++namespace workerd::server {
++
++struct TenantLimits {
++  // 0 = not limited.
++  int64_t cpuNs = 0;
++  int64_t startupCpuNs = 0;
++  size_t heapBytes = 0;
++  size_t bufferBytes = 0;
++
++  bool enabled() const {
++    return cpuNs > 0 || heapBytes > 0 || bufferBytes > 0;
++  }
++};
++
++// Limits from the environment, parsed once per process.
++const TenantLimits& tenantLimits();
++
++// Per-request enforcer: one per request (entrypoint), like NullLimitEnforcer.
++kj::Own<LimitEnforcer> newTenantLimitEnforcer(const TenantLimits& limits);
++
++// Per-isolate enforcer: one per isolate, like NullIsolateLimitEnforcer. `group` is the isolate
++// group the isolate will be created in: the buffer allocator must come from the same group.
++kj::Own<IsolateLimitEnforcer> newTenantIsolateLimitEnforcer(
++    const TenantLimits& limits, v8::IsolateGroup group);
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 04bdb8f..a919efe 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -2,6 +2,7 @@
+ // Licensed under the Apache 2.0 license found in the LICENSE file or at:
+ //     https://opensource.org/licenses/Apache-2.0
+ 
++#include "tenant-limits.h"
+ #include "worker-factory-impl.h"
+ 
+ #include <workerd/api/analytics-engine.capnp.h>
+@@ -1146,8 +1147,15 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+   }
+ 
+   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
++  // Multi-tenant limits when configured (tenant-limits.h), upstream's no-op otherwise.
++  kj::Own<LimitEnforcer> limitEnforcer;
++  if (tenantLimits().enabled()) {
++    limitEnforcer = newTenantLimitEnforcer(tenantLimits());
++  } else {
++    limitEnforcer = kj::refcounted<NullLimitEnforcer>();
++  }
+   return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
+-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
++      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(limitEnforcer), {},
+       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
+       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
+       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
+@@ -1701,7 +1709,14 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+   // The isolate of the Worker, or of the zygote that snapshots its startup.
+   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+-    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
++    // Multi-tenant limits when configured (tenant-limits.h), upstream's no-op otherwise.
++    auto isolateGroup = jsg::newIsolateGroup();
++    kj::Own<IsolateLimitEnforcer> limitEnforcer;
++    if (tenantLimits().enabled()) {
++      limitEnforcer = newTenantIsolateLimitEnforcer(tenantLimits(), isolateGroup);
++    } else {
++      limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
++    }
+     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
+       return Worker::Api::InboundListener{
+         .protocol = kj::str(listener.protocol),
+@@ -1710,7 +1725,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+       };
+     };
+     auto api = kj::heap<WorkerdApi>(factory.v8System, featureFlags, extensions,
+-        limitEnforcer->getCreateParams(), jsg::newIsolateGroup(),
++        limitEnforcer->getCreateParams(), kj::mv(isolateGroup),
+         kj::atomicRefcounted<JsgIsolateObserver>(), *factory.memoryCacheProvider,
+         options.pythonConfig, kj::mv(listeners), kj::mv(snapshotConfig));
+     Worker::LoggingOptions isolateLoggingOptions = options.loggingOptions;

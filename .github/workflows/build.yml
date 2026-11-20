@@ -1,0 +1,136 @@
+# Builds workerd + our patches for Linux arm64 and x86_64 and publishes both as a
+# GitHub release. The same toolchain image and script as a local build (Dockerfile,
+# build-in-container.sh), so the binaries match what the sites-host stand checks.
+#
+# Runs when VERSION or a patch changes on main, or by hand (Actions → build workerd →
+# Run workflow). The release tag is <VERSION>-ff.<hash of the patches>: the same
+# version + patches is never built twice unless run by hand with `force`.
+#
+# Free standard runners of a public repository: 4 cores, 16 GB RAM. No Bazel cache
+# between runs — every run compiles V8 (2.5–4 h on 4 cores, the job limit is 6 h).
+name: build workerd
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION, 'patches/**', Dockerfile, build-in-container.sh, .github/workflows/build.yml]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the release exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.tag.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          version=$(cat VERSION)
+          hash=$(cat patches/*.patch | sha256sum | cut -c1-8)
+          tag="$version-ff.$hash"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != true ] && gh release view "$tag" > /dev/null 2>&1; then
+            echo "release $tag exists — nothing to build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: x64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      # The V8 build with Bazel's output needs more than the runner's free disk:
+      # drop preinstalled SDKs we do not use, then build on the larger of / and /mnt.
+      - name: Free disk
+        run: |
+          df -h / /mnt 2>/dev/null || df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/lib/jvm /opt/microsoft /opt/google || true
+          docker system prune -af > /dev/null || true
+          root=$(df --output=avail -B1 / | tail -1)
+          mnt=$(df --output=avail -B1 /mnt 2>/dev/null | tail -1 || echo 0)
+          if [ "${mnt:-0}" -gt "$root" ]; then work=/mnt/workerd; else work=$HOME/workerd; fi
+          sudo mkdir -p "$work/src" "$work/cache" "$work/out"
+          echo "WORK=$work" >> "$GITHUB_ENV"
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Toolchain image
+        run: docker build -q -t workerd-toolchain .
+
+      - name: Build
+        run: |
+          started=$(date +%s)
+          docker run --rm \
+            -v "$WORK/src:/workerd" \
+            -v "$WORK/cache:/root/.cache" \
+            -v "$PWD/patches:/patches:ro" \
+            -v "$WORK/out:/out" \
+            workerd-toolchain build-workerd "${{ needs.plan.outputs.version }}" --strip=always
+          echo "built in $(( ($(date +%s) - started) / 60 )) min"
+          sudo du -sh "$WORK/src" "$WORK/cache" || true
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Package
+        run: |
+          name=workerd-linux-${{ matrix.arch }}
+          sudo cp "$WORK/out/workerd" "$name"
+          sudo chown "$(id -u)" "$name"
+          file "$name"
+          gzip -9 "$name"
+          sha256sum "$name.gz" > "$name.gz.sha256"
+          cat "$name.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workerd-linux-${{ matrix.arch }}
+          path: workerd-linux-${{ matrix.arch }}.gz*
+          retention-days: 7
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          ls -la dist
+          notes="workerd $VERSION (cloudflare/workerd) + patches/ at $GITHUB_SHA.
+
+          $(cat dist/*.sha256)"
+          gh release delete "$TAG" --yes --cleanup-tag > /dev/null 2>&1 || true
+          gh release create "$TAG" dist/* --title "$TAG" --notes "$notes"
